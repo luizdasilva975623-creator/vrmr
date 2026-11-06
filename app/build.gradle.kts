@@ -2,7 +2,7 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
 android {
   namespace = "com.luiz.vrmr"; compileSdk = 34
   defaultConfig {
-    applicationId = "com.luiz.vrmr"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "0.1"
+    applicationId = "com.luiz.vrmr"; minSdk = 24; targetSdk = 34; versionCode = 2; versionName = "0.2"
     ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
   }
   buildTypes { release { isMinifyEnabled = true; isShrinkResources = true } }

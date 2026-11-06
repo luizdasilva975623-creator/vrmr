@@ -6,6 +6,7 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
+import android.view.MotionEvent
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import javax.microedition.khronos.egl.EGLConfig
@@ -24,6 +25,12 @@ val TV = TH * 9f / 16f
 class Panel(val title: String, val w: Float, val h: Float, bw: Int, bh: Int) {
     val bmp: Bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
     var px = 0f; var py = 0f; var pz = 0f; var tex = 0; var dirty = true; var hover = -1; var pinned = false
+    var minimized = false
+    var lastFocused = 0L
+    var browserUrl: String? = null
+    var lastBrowserFrame: Bitmap? = null
+    var browserHeaderDrawn = false
+    var managerPage = 0
 }
 
 class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
@@ -46,6 +53,8 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
     private var gaze = 0f; private var menuYaw = 0f
     private var pinchPrev = false; private var cursorPinch = false
     private var dragging: Panel? = null; private var cursorVis = false
+    private var browserTouchPanel: Panel? = null
+    private var browserTouchX = 0f; private var browserTouchY = 0f
     private val ipd = 0.064f
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
 
@@ -56,7 +65,7 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
 
     override fun onSurfaceCreated(g: GL10?, c: EGLConfig?) {
         camP = prog("attribute vec2 aPos;attribute vec2 aTex;uniform mat4 uStm;varying vec2 vT;void main(){vT=(uStm*vec4(aTex,0.,1.)).xy;gl_Position=vec4(aPos*2.,0.,1.);}",
-            "#extension GL_OES_EGL_image_external : require\nprecision mediump float;varying vec2 vT;uniform samplerExternalOES uTex;uniform float uG;uniform float uL;void main(){vec3 c=min(texture2D(uTex,vT).rgb*uG,vec3(1.));gl_FragColor=vec4(mix(c,sqrt(c),uL),1.);}")
+            "#extension GL_OES_EGL_image_external : require\nprecision mediump float;varying vec2 vT;uniform samplerExternalOES uTex;uniform float uG;uniform float uL;uniform vec2 uP;void main(){vec3 c=texture2D(uTex,vT).rgb;if(uL>.15){c=(c*2.+texture2D(uTex,vT+vec2(uP.x,0.)).rgb+texture2D(uTex,vT-vec2(uP.x,0.)).rgb+texture2D(uTex,vT+vec2(0.,uP.y)).rgb+texture2D(uTex,vT-vec2(0.,uP.y)).rgb)/6.;}c=min(c*uG,vec3(1.));float y=dot(c,vec3(.3,.59,.11));c=mix(c,vec3(y),uL*.8);c=mix(c,sqrt(c),uL);gl_FragColor=vec4(c,1.);}")
         panP = prog("attribute vec2 aPos;attribute vec2 aTex;uniform mat4 uMvp;varying vec2 vT;void main(){vT=vec2(aTex.x,1.-aTex.y);gl_Position=uMvp*vec4(aPos,0.,1.);}",
             "precision mediump float;varying vec2 vT;uniform sampler2D uTex;void main(){gl_FragColor=texture2D(uTex,vT);}")
         linP = prog("attribute vec2 aPos;void main(){gl_Position=vec4(aPos,0.,1.);gl_PointSize=18.;}",
@@ -76,7 +85,8 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
         val c = Canvas(menu.bmp); val bw = menu.bmp.width.toFloat(); val bh = menu.bmp.height.toFloat()
         c.drawColor(0xEE141418.toInt()); val hdr = bh * .08f
         paint.color = Color.WHITE; paint.textSize = 30f; c.drawText("Menu", bw / 2, hdr * .7f, paint)
-        val cw = bw / 2; val ch = (bh - hdr) / 4
+        val footerH = bh * .12f
+        val cw = bw / 2; val ch = (bh - hdr - footerH) / 4
         for (i in names.indices) {
             val col = i % 2; val row = i / 2
             paint.color = if (i == menu.hover) 0xFF3D5AFE.toInt() else 0xFF2A2A31.toInt()
@@ -84,14 +94,83 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
             paint.color = Color.WHITE; paint.textSize = 34f
             c.drawText(names[i], col * cw + cw / 2, hdr + row * ch + ch / 2 + 12, paint)
         }
+        paint.color = 0xFF202027.toInt()
+        c.drawRoundRect(10f, bh - footerH + 4, bw - 10, bh - 4, 18f, 18f, paint)
+        val visible = panels.count { it !== menu && it.title != "Janelas" && !it.minimized }
+        val hidden = panels.count { it !== menu && it.title != "Janelas" && it.minimized }
+        paint.color = Color.WHITE; paint.textSize = 25f
+        c.drawText("Janelas  $visible ativas · $hidden minimizadas", bw / 2, bh - footerH / 2 + 8, paint)
         menu.dirty = true
     }
     private fun drawApp(p: Panel) {
+        if (p.browserUrl != null) { drawBrowser(p); return }
+        if (p.title == "Janelas") { drawManager(p); return }
         val c = Canvas(p.bmp); c.drawColor(0xEE141418.toInt()); val bw = p.bmp.width.toFloat()
         paint.color = 0xFF2A2A31.toInt(); c.drawRect(0f, 0f, bw, p.bmp.height * .08f, paint)
         paint.color = Color.WHITE; paint.textSize = 30f
         c.drawText(p.title, bw / 2, p.bmp.height * .056f, paint); c.drawText("X", bw - 40, p.bmp.height * .056f, paint)
-        paint.textSize = 36f; c.drawText("Janela flutuante: " + p.title, bw / 2, p.bmp.height / 2f, paint); p.dirty = true
+        if (p.title == "Config.") {
+            paint.color = 0xFF304050.toInt()
+            c.drawRoundRect(60f, 190f, bw - 60f, 300f, 22f, 22f, paint)
+            paint.color = Color.WHITE; paint.textSize = 28f
+            c.drawText("Abrir ajustes Bluetooth", bw / 2, 250f, paint)
+            paint.textSize = 20f
+            c.drawText("Emparelhe controles HID no Android.", bw / 2, 350f, paint)
+            c.drawText("Isso não espelha outros apps do celular.", bw / 2, 382f, paint)
+        } else {
+            paint.textSize = 30f
+            c.drawText("Janela pronta para conteúdo " + p.title, bw / 2, p.bmp.height / 2f - 8, paint)
+            paint.textSize = 22f
+            c.drawText("YouTube, Google e Mapas abrem páginas web.", bw / 2, p.bmp.height / 2f + 38, paint)
+        }
+        p.dirty = true
+    }
+    private fun managerItems() = panels.filter { it !== menu && it.title != "Janelas" }
+    private fun drawManager(p: Panel) {
+        val c = Canvas(p.bmp); val bw = p.bmp.width.toFloat(); val bh = p.bmp.height.toFloat()
+        c.drawColor(0xEE141418.toInt())
+        paint.color = 0xFF2A2A31.toInt(); c.drawRect(0f, 0f, bw, 58f, paint)
+        paint.color = Color.WHITE; paint.textSize = 30f
+        c.drawText("Janelas  •  até 3 na frente", bw / 2, 39f, paint); c.drawText("X", bw - 40, 39f, paint)
+        val items = managerItems(); val pages = ((items.size + 4) / 5).coerceAtLeast(1)
+        p.managerPage = p.managerPage.coerceIn(0, pages - 1)
+        for (row in 0 until 5) {
+            val index = p.managerPage * 5 + row
+            if (index >= items.size) break
+            val item = items[index]
+            val top = 70f + row * 72f
+            paint.color = if (item.minimized) 0xFF26262D.toInt() else 0xFF304050.toInt()
+            c.drawRoundRect(14f, top, bw - 14, top + 62f, 14f, 14f, paint)
+            paint.color = Color.WHITE; paint.textAlign = Paint.Align.LEFT; paint.textSize = 26f
+            c.drawText(item.title, 34f, top + 27f, paint)
+            paint.textSize = 19f
+            c.drawText(if (item.minimized) "Minimizada · toque para restaurar" else "Na área de trabalho · toque para trazer à frente", 34f, top + 51f, paint)
+            paint.textAlign = Paint.Align.CENTER
+        }
+        paint.color = Color.WHITE; paint.textSize = 22f
+        c.drawText("‹", 50f, bh - 18f, paint)
+        c.drawText("${p.managerPage + 1} / $pages", bw / 2, bh - 18f, paint)
+        c.drawText("›", bw - 50f, bh - 18f, paint)
+        p.dirty = true
+    }
+    private fun drawBrowser(p: Panel) {
+        val frame = act.browserFrame(p.title)
+        val changed = frame != null && frame !== p.lastBrowserFrame
+        if (changed || !p.browserHeaderDrawn) {
+            val c = Canvas(p.bmp)
+            if (changed) {
+                c.drawColor(Color.WHITE)
+                c.drawBitmap(frame!!, null, Rect(0, 56, p.bmp.width, p.bmp.height), paint)
+                p.lastBrowserFrame = frame
+            } else c.drawColor(Color.WHITE)
+            paint.color = 0xFF202027.toInt(); c.drawRect(0f, 0f, p.bmp.width.toFloat(), 56f, paint)
+            paint.color = Color.WHITE; paint.textSize = 24f
+            c.drawText("‹", 30f, 38f, paint)
+            paint.textSize = 22f; c.drawText(p.title, p.bmp.width / 2f, 37f, paint)
+            c.drawText("X", p.bmp.width - 30f, 37f, paint)
+            p.browserHeaderDrawn = true
+            p.dirty = true
+        }
     }
     private fun drawCursor(pin: Boolean) {
         val c = Canvas(cursor.bmp); c.drawColor(0, PorterDuff.Mode.CLEAR)
@@ -120,32 +199,124 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
     private fun place(p: Panel, yaw: Float, d: Float) { p.px = sin(yaw) * d; p.py = cos(yaw) * d; p.pz = 0f }
 
     private fun logic(R: FloatArray) {
-        if (!act.hv) { cursorVis = false; pinchPrev = false; dragging = null; return }
+        if (!act.hv) {
+            browserTouchPanel?.let { act.dispatchBrowserTouch(it.title, MotionEvent.ACTION_CANCEL, browserTouchX, browserTouchY) }
+            browserTouchPanel = null; cursorVis = false; pinchPrev = false; dragging = null
+            return
+        }
         val dx = (act.hx * 2 - 1) * TH; val dy = (1 - act.hy * 2) * TV; val dz = -1f
         var X = R[0] * dx + R[4] * dy + R[8] * dz; var Y = R[1] * dx + R[5] * dy + R[9] * dz; var Z = R[2] * dx + R[6] * dy + R[10] * dz
         val n = sqrt(X * X + Y * Y + Z * Z); X /= n; Y /= n; Z /= n
         val pinch = if (pinchPrev) act.hp < 0.45f else act.hp < 0.30f
         var hp: Panel? = null; var h: FloatArray? = null
-        for (p in panels.asReversed()) { val r = hit(p, X, Y, Z); if (r != null) { hp = p; h = r; break } }
+        for (p in panels.asReversed()) {
+            if (p.minimized) continue
+            val r = hit(p, X, Y, Z); if (r != null) { hp = p; h = r; break }
+        }
         dragging?.let { d -> if (pinch) { val len = sqrt(d.px * d.px + d.py * d.py + d.pz * d.pz); d.px = X * len; d.py = Y * len; d.pz = Z * len } }
         if (h != null) { cursor.px = h[2] + h[5] * .01f; cursor.py = h[3] + h[6] * .01f; cursor.pz = h[4] } else { cursor.px = X * 1.4f; cursor.py = Y * 1.4f; cursor.pz = Z * 1.4f }
         cursorVis = true
-        val idx = if (hp === menu && h!![1] < .92f) (((1f - h[1]) - .08f) / .92f * 4).toInt().coerceIn(0, 3) * 2 + (h[0] * 2).toInt().coerceIn(0, 1) else -1
+        val menuV = h?.get(1) ?: -1f
+        val idx = if (hp === menu && menuV in .12f.. .92f)
+            (((.92f - menuV) / .80f * 4).toInt().coerceIn(0, 3) * 2 + (h!![0] * 2).toInt().coerceIn(0, 1))
+        else -1
         if (idx != menu.hover) { menu.hover = idx; drawMenu() }
         if (pinch && !pinchPrev && hp != null && dragging == null) {
-            if (h!![1] > .92f) { if (h[0] > .88f && hp !== menu) panels.remove(hp) else { dragging = hp; hp.pinned = true } }
-            else if (hp === menu && idx >= 0) open(names[idx])
+            val px = h!![0] * 768f
+            val py = (1f - h[1]) * 512f
+            if (hp === menu) {
+                if (h[1] < .12f) open("Janelas") else if (idx >= 0) open(names[idx])
+            } else if (hp.title == "Janelas") {
+                if (py < 58f && h[0] > .88f) removePanel(hp)
+                else { focusPanel(hp); managerClick(hp, h[0], h[1]) }
+            } else if (hp.browserUrl != null && py >= 56f) {
+                focusPanel(hp)
+                browserTouchPanel = hp
+                browserTouchX = h[0]
+                browserTouchY = ((py - 56f) / 456f).coerceIn(0f, 1f)
+                act.dispatchBrowserTouch(hp.title, MotionEvent.ACTION_DOWN, browserTouchX, browserTouchY)
+            } else if (h[1] > .92f && h[0] > .88f) removePanel(hp)
+            else if (hp.browserUrl != null && py < 56f && px < 80f) act.browserBack(hp.title)
+            else if (hp.title == "Config." && py in 180f..330f) act.openBluetoothSettings()
+            else { focusPanel(hp); dragging = hp; hp.pinned = true }
         }
-        if (!pinch) dragging = null
+        if (pinch && pinchPrev && browserTouchPanel != null) {
+            val target = browserTouchPanel!!
+            val targetHit = hit(target, X, Y, Z)
+            if (targetHit != null) {
+                val py = (1f - targetHit[1]) * 512f
+                browserTouchX = targetHit[0]
+                browserTouchY = ((py - 56f) / 456f).coerceIn(0f, 1f)
+                act.dispatchBrowserTouch(target.title, MotionEvent.ACTION_MOVE, browserTouchX, browserTouchY)
+            }
+        }
+        if (!pinch) {
+            dragging = null
+            browserTouchPanel?.let { act.dispatchBrowserTouch(it.title, MotionEvent.ACTION_UP, browserTouchX, browserTouchY) }
+            browserTouchPanel = null
+        }
         pinchPrev = pinch
         if (pinch != cursorPinch) { cursorPinch = pinch; drawCursor(pinch) }
     }
     private fun open(name: String) {
-        if (panels.any { it.title == name }) return
-        val p = Panel(name, 0.9f, 0.6f, 768, 512); place(p, gaze + .2f + .6f * (panels.size - 1), 1.6f); drawApp(p); panels.add(p)
+        panels.firstOrNull { it.title == name }?.let { focusPanel(it); return }
+        val p = Panel(name, 0.9f, 0.6f, 768, 512)
+        val activeBefore = panels.count { it !== menu && it.title != "Janelas" && !it.minimized }
+        place(p, gaze + (activeBefore.coerceAtMost(2) - 1) * .38f, 1.6f)
+        p.lastFocused = android.os.SystemClock.uptimeMillis()
+        when (name) {
+            "Google" -> { p.browserUrl = "https://www.google.com/"; act.openBrowserPanel(name, p.browserUrl!!) }
+            "YouTube" -> { p.browserUrl = "https://m.youtube.com/"; act.openBrowserPanel(name, p.browserUrl!!) }
+            "Mapas" -> { p.browserUrl = "https://maps.google.com/"; act.openBrowserPanel(name, p.browserUrl!!) }
+            else -> drawApp(p)
+        }
+        panels.add(p)
+        focusPanel(p)
+        drawMenu()
+        panels.firstOrNull { it.title == "Janelas" }?.let { drawManager(it) }
+    }
+    private fun focusPanel(p: Panel) {
+        if (p === menu) return
+        p.minimized = false
+        p.browserUrl?.let { act.setBrowserActive(p.title, true) }
+        p.lastFocused = android.os.SystemClock.uptimeMillis()
+        panels.remove(p); panels.add(p)
+        val visible = panels.filter { it !== menu && it.title != "Janelas" && !it.minimized }
+        if (visible.size > 3) {
+            visible.filter { it !== p }.minByOrNull { it.lastFocused }?.let { victim ->
+                victim.minimized = true
+                if (victim.browserUrl != null) act.setBrowserActive(victim.title, false)
+            }
+        }
+        drawMenu()
+        panels.firstOrNull { it.title == "Janelas" }?.let { drawManager(it) }
+    }
+    private fun removePanel(p: Panel) {
+        panels.remove(p)
+        if (p.browserUrl != null) act.closeBrowserPanel(p.title)
+        drawMenu()
+        panels.firstOrNull { it.title == "Janelas" }?.let { drawManager(it) }
+    }
+    private fun managerClick(p: Panel, u: Float, v: Float) {
+        val y = (1f - v) * 512f
+        if (y >= 460f) {
+            val count = managerItems().size
+            val pages = ((count + 4) / 5).coerceAtLeast(1)
+            p.managerPage = when {
+                u < .25f -> (p.managerPage - 1).coerceAtLeast(0)
+                u > .75f -> (p.managerPage + 1).coerceAtMost(pages - 1)
+                else -> p.managerPage
+            }
+            drawManager(p)
+        } else if (y in 70f..430f) {
+            val row = ((y - 70f) / 72f).toInt()
+            managerItems().getOrNull(p.managerPage * 5 + row)?.let { focusPanel(it) }
+        }
     }
 
     private fun drawPanel(p: Panel) {
+        if (p.minimized) return
+        if (p.browserUrl != null) drawBrowser(p)
         ensure(p)
         val l = hypot(p.px, p.py).coerceAtLeast(1e-3f); val nx = -p.px / l; val ny = -p.py / l
         java.util.Arrays.fill(m, 0f)
@@ -198,7 +369,9 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
         if (hypot(R[8], R[9]) > .3f) gaze = atan2(-R[8], -R[9])
         if (recenter && (act.hasRot || frames > 120)) {
             menu.pinned = false; menuYaw = gaze - .4f
-            for (i in 1 until panels.size) place(panels[i], gaze + .2f + .6f * (i - 1), 1.6f)
+            val visible = panels.filter { it !== menu && it.title != "Janelas" && !it.minimized }.take(3)
+            for (i in visible.indices) place(visible[i], gaze + (i - 1) * .38f, 1.6f)
+            panels.firstOrNull { it.title == "Janelas" }?.let { place(it, gaze, 1.45f) }
             recenter = false
         }
         if (!menu.pinned) {
@@ -215,7 +388,7 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
             quad.position(2); GLES20.glVertexAttribPointer(1, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(1)
             GLES20.glUseProgram(camP)
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(camP, "uStm"), 1, false, stm, 0)
-            val gn = act.gain; GLES20.glUniform1f(GLES20.glGetUniformLocation(camP, "uG"), gn); GLES20.glUniform1f(GLES20.glGetUniformLocation(camP, "uL"), ((gn - 1f) / 3f).coerceIn(0f, 1f))
+            val gn = act.gain; GLES20.glUniform1f(GLES20.glGetUniformLocation(camP, "uG"), gn); GLES20.glUniform1f(GLES20.glGetUniformLocation(camP, "uL"), ((gn - 1f) / 3f).coerceIn(0f, 1f)); GLES20.glUniform2f(GLES20.glGetUniformLocation(camP, "uP"), 1.5f / 1280f, 1.5f / 720f)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oes)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             Matrix.setIdentityM(T, 0); Matrix.translateM(T, 0, if (!vrm) 0f else if (e == 0) ipd / 2 else -ipd / 2, 0f, 0f)
