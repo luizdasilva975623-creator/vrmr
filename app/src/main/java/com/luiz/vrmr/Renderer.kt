@@ -11,6 +11,9 @@ import java.nio.ByteOrder
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.sqrt
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 
 class Panel(val title: String, val w: Float, val h: Float, bw: Int, bh: Int) {
     val bmp: Bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
@@ -30,7 +33,7 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
     private val menu = Panel("Menu", 0.5f, 0.75f, 512, 768)
     private val cursor = Panel("c", 0.04f, 0.04f, 64, 64)
     private val panels = mutableListOf(menu)
-    private var placed = false; private var pinchPrev = false; private var cursorPinch = false
+    @Volatile var vr = true; @Volatile var recenter = true; private var yaw0 = 0f; private var frames = 0; private var pinchPrev = false; private var cursorPinch = false
     private var dragging: Panel? = null; private var cursorVis = false
     private val ipd = 0.064f
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
@@ -101,14 +104,14 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
         val u = (lx * -ny + ly * nx) / p.w + .5f; val v = lz / p.h + .5f
         return if (u in 0f..1f && v in 0f..1f) floatArrayOf(u, v, x * t, y * t, z * t, nx, ny) else null
     }
-    private fun setFwd(p: Panel, R: FloatArray, d: Float) { p.px = -R[8] * d; p.py = -R[9] * d; p.pz = -R[10] * d }
+    private fun place(p: Panel, yaw: Float, d: Float) { p.px = sin(yaw) * d; p.py = cos(yaw) * d; p.pz = 0f }
 
     private fun logic(R: FloatArray, aspect: Float) {
         if (!act.hv) { cursorVis = false; pinchPrev = false; dragging = null; return }
         val dx = (act.hx * 2 - 1) * aspect; val dy = 1 - act.hy * 2; val dz = -1f
         var X = R[0] * dx + R[4] * dy + R[8] * dz; var Y = R[1] * dx + R[5] * dy + R[9] * dz; var Z = R[2] * dx + R[6] * dy + R[10] * dz
         val n = sqrt(X * X + Y * Y + Z * Z); X /= n; Y /= n; Z /= n
-        val pinch = act.hp < 0.35f
+        val pinch = if (pinchPrev) act.hp < 0.45f else act.hp < 0.30f
         var hp: Panel? = null; var h: FloatArray? = null
         for (p in panels.asReversed()) { val r = hit(p, X, Y, Z); if (r != null) { hp = p; h = r; break } }
         dragging?.let { d -> if (pinch) { val len = sqrt(d.px * d.px + d.py * d.py + d.pz * d.pz); d.px = X * len; d.py = Y * len; d.pz = Z * len } }
@@ -126,7 +129,7 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
     }
     private fun open(name: String, R: FloatArray) {
         if (panels.any { it.title == name }) return
-        val p = Panel(name, 0.9f, 0.6f, 768, 512); setFwd(p, R, 1.6f); drawApp(p); panels.add(p)
+        val p = Panel(name, 0.9f, 0.6f, 768, 512); place(p, yaw0 + .25f + .6f * (panels.size - 1), 1.6f); drawApp(p); panels.add(p)
     }
 
     private fun drawPanel(p: Panel) {
@@ -145,20 +148,25 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
         val s = st ?: return
         try { s.updateTexImage(); s.getTransformMatrix(stm) } catch (_: Exception) { }
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        val R = act.rot; val aspect = (W / 2f) / H
-        if (!placed) { setFwd(menu, R, 1.4f); placed = true }
+        frames++
+        val R = act.rot; val vrm = vr; val eyes = if (vrm) 2 else 1; val aspect = (W / eyes.toFloat()) / H
+        if (recenter && (act.hasRot || frames > 120)) {
+            yaw0 = atan2(-R[8], -R[9]); place(menu, yaw0 - .45f, 1.4f)
+            for (i in 1 until panels.size) place(panels[i], yaw0 + .25f + .6f * (i - 1), 1.6f)
+            recenter = false
+        }
         logic(R, aspect)
         GLES20.glEnable(GLES20.GL_BLEND); GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         Matrix.perspectiveM(proj, 0, 90f, aspect, .05f, 30f); Matrix.transposeM(V, 0, R, 0)
-        for (e in 0..1) {
-            GLES20.glViewport(e * W / 2, 0, W / 2, H)
+        for (e in 0 until eyes) {
+            GLES20.glViewport(e * W / eyes, 0, W / eyes, H)
             quad.position(0); GLES20.glVertexAttribPointer(0, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(0)
             quad.position(2); GLES20.glVertexAttribPointer(1, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(1)
             GLES20.glUseProgram(camP)
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(camP, "uStm"), 1, false, stm, 0)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oes)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            Matrix.setIdentityM(T, 0); Matrix.translateM(T, 0, if (e == 0) ipd / 2 else -ipd / 2, 0f, 0f)
+            Matrix.setIdentityM(T, 0); Matrix.translateM(T, 0, if (!vrm) 0f else if (e == 0) ipd / 2 else -ipd / 2, 0f, 0f)
             Matrix.multiplyMM(Ve, 0, T, 0, V, 0); Matrix.multiplyMM(vp, 0, proj, 0, Ve, 0)
             for (p in panels) drawPanel(p)
             if (cursorVis) drawPanel(cursor)

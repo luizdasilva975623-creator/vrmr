@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Size
 import android.view.Surface
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -29,8 +30,8 @@ import kotlin.math.hypot
 class MainActivity : ComponentActivity(), SensorEventListener {
     lateinit var view: GLSurfaceView
     lateinit var rend: Renderer
-    @Volatile var rot = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }; @Volatile var hasRot = false
-    private val grav = FloatArray(3); private val geo = FloatArray(3); private var haveA = false; private var haveM = false
+    @Volatile var rot = floatArrayOf(1f,0f,0f,0f, 0f,0f,1f,0f, 0f,-1f,0f,0f, 0f,0f,0f,1f); @Volatile var hasRot = false
+    private val grav = FloatArray(3); private val geo = FloatArray(3); private var lastSeen = 0L; private var useFb = false; private var haveA = false; private var haveM = false
     fun msg(t: String) = runOnUiThread { android.widget.Toast.makeText(this, t, android.widget.Toast.LENGTH_LONG).show() }
     @Volatile var hx = 0f; @Volatile var hy = 0f; @Volatile var hp = 1f; @Volatile var hv = false
     private val raw = FloatArray(16)
@@ -49,8 +50,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         try {
             hl = HandLandmarker.createFromOptions(this, HandLandmarker.HandLandmarkerOptions.builder()
                 .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
-                .setRunningMode(RunningMode.VIDEO).setNumHands(1).build())
+                .setRunningMode(RunningMode.VIDEO).setNumHands(1).setMinHandDetectionConfidence(0.35f).setMinHandPresenceConfidence(0.35f).setMinTrackingConfidence(0.35f).build())
         } catch (e: Throwable) { msg("Mãos desativadas: " + e.message) }
+        msg("Vol+: recentralizar | Vol-: alternar 2D/VR")
         val req = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> perm = ok; if (ok) startCamera() }
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) perm = true
         else req.launch(Manifest.permission.CAMERA)
@@ -69,7 +71,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 val sf = Surface(s)
                 rq.provideSurface(sf, ContextCompat.getMainExecutor(this)) { sf.release() }
             }
-            val an = ImageAnalysis.Builder().setTargetResolution(Size(640, 480))
+            val an = ImageAnalysis.Builder().setTargetResolution(Size(640, 360))
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
             an.setAnalyzer(exec) { analyze(it) }
@@ -87,23 +89,36 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 android.graphics.Matrix().apply { postRotate(r.toFloat()) }, false)
             val res = hl?.detectForVideo(BitmapImageBuilder(bmp).build(), SystemClock.uptimeMillis())
             val lm = res?.landmarks()?.firstOrNull()
-            if (lm == null) { hv = false } else {
+            if (lm == null) { if (SystemClock.uptimeMillis() - lastSeen > 200) hv = false } else {
+                lastSeen = SystemClock.uptimeMillis()
                 val a = lm[4]; val i = lm[8]; val w = lm[0]; val m = lm[9]
                 val size = hypot(w.x() - m.x(), w.y() - m.y()).coerceAtLeast(1e-3f)
                 hp = hypot(a.x() - i.x(), a.y() - i.y()) / size
-                hx = i.x(); hy = i.y(); hv = true
+                hx = if (hv) hx * .5f + i.x() * .5f else i.x(); hy = if (hv) hy * .5f + i.y() * .5f else i.y(); hv = true
             }
         } catch (_: Exception) { } finally { img.close() }
     }
 
+    private fun ortho(m: FloatArray) {
+        var n = kotlin.math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]); m[0] /= n; m[1] /= n; m[2] /= n
+        val d = m[4] * m[0] + m[5] * m[1] + m[6] * m[2]; m[4] -= d * m[0]; m[5] -= d * m[1]; m[6] -= d * m[2]
+        n = kotlin.math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]); m[4] /= n; m[5] /= n; m[6] /= n
+        m[8] = m[1] * m[6] - m[2] * m[5]; m[9] = m[2] * m[4] - m[0] * m[6]; m[10] = m[0] * m[5] - m[1] * m[4]
+    }
+    override fun onKeyDown(k: Int, e: KeyEvent?): Boolean {
+        if (k == KeyEvent.KEYCODE_VOLUME_UP) { rend.recenter = true; return true }
+        if (k == KeyEvent.KEYCODE_VOLUME_DOWN) { rend.vr = !rend.vr; return true }
+        return super.onKeyDown(k, e)
+    }
     override fun onResume() {
         super.onResume(); view.onResume()
         val sm = getSystemService(SENSOR_SERVICE) as SensorManager
         val g = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR) ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        if (g != null) sm.registerListener(this, g, SensorManager.SENSOR_DELAY_GAME)
+        useFb = g == null
+        if (g != null) sm.registerListener(this, g, 10000)
         else {
             val a = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER); val m = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
-            if (a != null && m != null) { sm.registerListener(this, a, SensorManager.SENSOR_DELAY_GAME); sm.registerListener(this, m, SensorManager.SENSOR_DELAY_GAME) }
+            if (a != null && m != null) { sm.registerListener(this, a, 10000); sm.registerListener(this, m, 10000) }
             else msg("Sem sensores de movimento: painéis ficam fixos")
         }
     }
@@ -125,6 +140,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (windowManager.defaultDisplay.rotation == Surface.ROTATION_270)
             SensorManager.remapCoordinateSystem(raw, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, out)
         else SensorManager.remapCoordinateSystem(raw, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, out)
+        if (hasRot) { val o = rot; val a = if (useFb) .12f else .6f; for (i in 0..14) out[i] = o[i] * (1 - a) + out[i] * a; ortho(out) }
         rot = out; hasRot = true
     }
     override fun onAccuracyChanged(s: Sensor?, a: Int) {}
