@@ -145,7 +145,6 @@ class Renderer(val act: MainActivity) : GLSurfaceView.Renderer {
         val s = st ?: return
         try { s.updateTexImage(); s.getTransformMatrix(stm) } catch (_: Exception) { }
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        if (!act.hasRot) return
         val R = act.rot; val aspect = (W / 2f) / H
         if (!placed) { setFwd(menu, R, 1.4f); placed = true }
         logic(R, aspect)
